@@ -1,8 +1,16 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import * as M from './model.js';
 import { readGuestFile, exportExcel } from './io.js';
 import { sampleGuests } from './sample.js';
 import { newId } from './ops.js';
+import { chairTapAction, pickerGuests, zoomScroll, clampZoom } from './tap.js';
+
+const MOBILE_Q = '(max-width: 800px)';
+function useIsMobile() {
+  const [m, setM] = useState(() => window.matchMedia(MOBILE_Q).matches);
+  useEffect(() => { const mq = window.matchMedia(MOBILE_Q); const f = () => setM(mq.matches); mq.addEventListener('change', f); return () => mq.removeEventListener('change', f); }, []);
+  return m;
+}
 
 const TABLE_R = 36, RING = 56, CHAIR_R = 13;
 const PALETTE = ['#e07a5f', '#3d85c6', '#5aa469', '#9b72cf', '#e0a020', '#2a9d8f', '#d1495b', '#7a7a7a', '#c2569b', '#4c6ef5'];
@@ -39,7 +47,16 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
   const [selGuest, setSelGuest] = useState(null);
   const [search, setSearch] = useState('');
   const [showSeated, setShowSeated] = useState(false);
-  const [zoom, setZoom] = useState(1);
+  const isMobile = useIsMobile();
+  const [zoom, setZoomRaw] = useState(() => (window.matchMedia(MOBILE_Q).matches ? 2 : 1));
+  const [mtab, setMtab] = useState('plan');          // phone: which panel is showing
+  const [menuOpen, setMenuOpen] = useState(false);   // phone: ☰ menu
+  const [picker, setPicker] = useState(null);        // {table, seat}: choose a guest for this chair
+  const [pickerQ, setPickerQ] = useState('');
+  const [pickerAll, setPickerAll] = useState(false);
+  const [chairMenu, setChairMenu] = useState(null);  // phone: tapped a seated chair
+  const scrollRef = useRef(null);
+  const zoomRef = useRef(zoom);
   const [arrange, setArrange] = useState(false);
   const [drag, setDrag] = useState(null);
   const [hover, setHover] = useState(null);
@@ -50,6 +67,35 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
   const svgRef = useRef(null);
   const fileRef = useRef(null);
 
+  // zoom around the middle of the visible plan
+  const setZoom = (z) => setZoomRaw((old) => clampZoom(typeof z === 'function' ? z(old) : z));
+  useLayoutEffect(() => {
+    const el = scrollRef.current, old = zoomRef.current;
+    zoomRef.current = zoom;
+    if (!el || old === zoom) return;
+    el.scrollLeft = zoomScroll(el.scrollLeft, el.clientWidth, old, zoom);
+    el.scrollTop = zoomScroll(el.scrollTop, el.clientHeight, old, zoom);
+  }, [zoom]);
+  // two-finger pinch on the plan changes the zoom (one finger scrolls as normal)
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let start = null;
+    const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const ts = (e) => { if (e.touches.length === 2) start = { d: dist(e.touches), z: zoomRef.current }; };
+    const tm = (e) => { if (e.touches.length === 2 && start) { e.preventDefault(); setZoom(start.z * (dist(e.touches) / start.d)); } };
+    const te = (e) => { if (e.touches.length < 2) start = null; };
+    el.addEventListener('touchstart', ts, { passive: true });
+    el.addEventListener('touchmove', tm, { passive: false });
+    el.addEventListener('touchend', te);
+    return () => { el.removeEventListener('touchstart', ts); el.removeEventListener('touchmove', tm); el.removeEventListener('touchend', te); };
+  }, [isMobile]);
+  // phone: start with the plan centred left-right
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (isMobile && el) el.scrollLeft = (el.scrollWidth - el.clientWidth) / 2;
+  }, [isMobile]);
+  const openPicker = (table, seat) => { setPicker({ table, seat }); setPickerQ(''); setPickerAll(false); };
   const doUndo = () => { if (undo && undo()) say('Undone'); };
   const say = (t) => { setMsg(t); clearTimeout(say.t); say.t = setTimeout(() => setMsg(''), 4000); };
 
@@ -57,7 +103,7 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
     const onKey = (e) => {
       if (/INPUT|TEXTAREA/.test(document.activeElement?.tagName)) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); doUndo(); }
-      if (e.key === 'Escape') { setSelGuest(null); setSelTable(null); }
+      if (e.key === 'Escape') { setSelGuest(null); setSelTable(null); setPicker(null); setChairMenu(null); setMenuOpen(false); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -75,7 +121,7 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
 
   // ---------- drag and drop (pointer based, works for list, chairs and the side panel) ----------
   function startDrag(e, gid) {
-    if (e.button !== 0 || arrange) return;
+    if (e.button !== 0 || arrange || e.pointerType === 'touch') return; // phones use tap-to-seat instead
     e.preventDefault();
     const sx = e.clientX, sy = e.clientY;
     let active = false;
@@ -112,8 +158,12 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
   }
   function clickSeat(t, i) {
     if (justDragged.current || arrange) return;
-    if (selGuest) { drop(selGuest, { kind: 'seat', table: t.id, seat: i }); setSelTable(t.id); return; }
-    setSelTable(t.id);
+    const occ = t.seats[i] || null;
+    const action = chairTapAction(selGuest, occ);
+    if (action === 'cancel') { setSelGuest(null); say('Move cancelled'); return; }
+    if (action === 'place') { drop(selGuest, { kind: 'seat', table: t.id, seat: i }); setSelTable(t.id); return; }
+    if (!isMobile) { setSelTable(t.id); return; }
+    if (action === 'pick') openPicker(t.id, i); else setChairMenu({ gid: occ, table: t.id, seat: i });
   }
   function startTableMove(e, t) {
     e.preventDefault();
@@ -153,9 +203,9 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
 
   // ---------- floor plan ----------
   const chairPos = (t, i) => { const a = ((-90 + (i * 360) / t.seats.length) * Math.PI) / 180; return [t.x + RING * Math.cos(a), t.y + RING * Math.sin(a), a]; };
-  const showTip = (e, g, t, i) => setHover({ x: e.clientX, y: e.clientY, title: g ? g.name : `Empty seat`, sub: `Table ${t.label} · Seat ${i + 1}${g?.group ? ' · ' + g.group : ''}` });
+  const showTip = (e, g, t, i) => !isMobile && setHover({ x: e.clientX, y: e.clientY, title: g ? g.name : `Empty seat`, sub: `Table ${t.label} · Seat ${i + 1}${g?.group ? ' · ' + g.group : ''}` });
   const plan = (
-    <svg ref={svgRef} viewBox={`0 0 ${M.PLAN_W} ${M.PLAN_H}`} className="plan" style={{ height: `${zoom * 100}%` }}>
+    <svg ref={svgRef} viewBox={`0 0 ${M.PLAN_W} ${M.PLAN_H}`} className="plan" style={isMobile ? { width: `${zoom * 100}%`, height: 'auto' } : { height: `${zoom * 100}%` }}>
       <g transform={`scale(${S})`} className="room">
         <rect x="20" y="40" width="640" height="690" className="wall" />
         {[120, 315, 510].map((x) => <g key={x}><rect x={x} y="36" width="50" height="8" className="gap" /><path d={`M${x} 40 A50 50 0 0 1 ${x + 50} 40`} className="swing" transform={`translate(0,0)`} /></g>)}
@@ -175,7 +225,7 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
           <g key={t.id} className={'tbl' + (t.id === selTable ? ' sel' : '') + (arrange ? ' arrange' : '')}>
             <circle cx={t.x} cy={t.y} r={TABLE_R} data-drop="table" data-table={t.id}
               className={'table' + (t.vip ? ' vip' : '') + (drag && drag.over === `table:${t.id}:` ? ' over' : '') + (n === t.seats.length ? ' full' : '')}
-              onPointerDown={arrange ? (e) => startTableMove(e, t) : undefined} onClick={() => !arrange && !justDragged.current && setSelTable(t.id)} />
+              onPointerDown={arrange ? (e) => startTableMove(e, t) : undefined} onClick={() => { if (arrange || justDragged.current) return; setSelTable(t.id); if (isMobile) setMtab('table'); }} />
             <text x={t.x} y={t.y - 3} className="tlabel">{t.label}</text>
             <text x={t.x} y={t.y + 14} className="tcount">{n}/{t.seats.length}</text>
             {t.seats.map((gid, i) => {
@@ -185,8 +235,9 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
               return (
                 <g key={i} data-drop="seat" data-table={t.id} data-seat={i} className={'chair' + (g ? ' taken' : '') + (over ? ' over' : '') + (g && selGuest === gid ? ' picked' : '')}
                   onPointerDown={g ? (e) => startDrag(e, gid) : undefined} onClick={() => clickSeat(t, i)}
-                  onDoubleClick={g ? () => { dispatch({ type: 'unseat', gid }); say(`${g.name} moved back to the list`); } : undefined}
+                  onDoubleClick={g && !isMobile ? () => { dispatch({ type: 'unseat', gid }); say(`${g.name} moved back to the list`); } : undefined}
                   onMouseEnter={(e) => showTip(e, g, t, i)} onMouseMove={(e) => showTip(e, g, t, i)} onMouseLeave={() => setHover(null)}>
+                  <circle cx={cx} cy={cy} r={17} className="hit" />
                   <circle cx={cx} cy={cy} r={CHAIR_R} style={g ? { fill: color(g) } : undefined} />
                   <text x={cx} y={cy + 4}>{g ? initials(g.name) : i + 1}</text>
                 </g>
@@ -195,7 +246,7 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
           </g>
         );
       })}
-      {showNames && zoom >= 1.5 && state.tables.map((t) => t.seats.map((gid, i) => {
+      {showNames && zoom >= (isMobile ? 3 : 1.5) && state.tables.map((t) => t.seats.map((gid, i) => {
         const g = gid && byId.get(gid);
         if (!g) return null;
         const a = chairPos(t, i)[2], r = RING + CHAIR_R + 3;
@@ -208,7 +259,11 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
     const w = where.get(g.id);
     return (
       <div key={g.id} className={'chip' + (selGuest === g.id ? ' picked' : '') + (w ? ' seated' : '')} onPointerDown={(e) => startDrag(e, g.id)}
-        onClick={() => !justDragged.current && setSelGuest(selGuest === g.id ? null : g.id)} title="Drag onto a chair, or click then click a chair">
+        onClick={() => {
+          if (justDragged.current) return;
+          if (isMobile) { setSelGuest(g.id); setMtab('plan'); return; }
+          setSelGuest(selGuest === g.id ? null : g.id);
+        }} title="Drag onto a chair, or click then click a chair">
         <span className="dot" style={{ background: color(g) }} />
         <span className="nm">{g.name}</span>
         {g.group && <span className="tag">{g.group}</span>}
@@ -219,19 +274,22 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
   };
 
   return (
-    <div className={'app' + (drag ? ' dragging' : '')}>
+    <div className={'app' + (drag ? ' dragging' : '') + ` m-tab-${mtab}` + (menuOpen ? ' menu-open' : '') + (selGuest ? ' picking' : '')}>
       <header>
-        <h1>💍 Wedding Seating</h1>
+        <h1>💍 <span className="d-only">Wedding </span>Seating</h1>
         {syncBar}
         <div className="stats">
-          <b>{seated}</b> / {total} guests seated · {chairs} chairs · {state.tables.length} tables
-          {total - seated > 0 && <span className="warn"> · {total - seated} not seated</span>}
+          <b>{seated}</b> / {total} <span className="d-only">guests </span>seated<span className="d-only"> · {chairs} chairs · {state.tables.length} tables</span>
+          {total - seated > 0 && <span className="warn d-only"> · {total - seated} not seated</span>}
         </div>
-        <div className="tools">
+        <button className="m-only menubtn" aria-label="Menu" onClick={() => setMenuOpen(!menuOpen)}>{menuOpen ? '✕' : '☰'}</button>
+        <div className="tools" onClick={(e) => { if (isMobile && e.target.closest('button')) setMenuOpen(false); }}>
+          <button className="m-only" onClick={() => { setMtab('guests'); }}>➕ Add / paste names</button>
+          <button className="m-only" onClick={() => fileRef.current.click()}>📄 Import Excel / CSV…</button>
           {undo && <button onClick={doUndo} disabled={!canUndo} title="Ctrl+Z">↶ Undo</button>}
           <button onClick={() => { const id = newId('t'); const r = M.addTable(stateRef.current, id); dispatch({ type: 'addTable', id }); setSelTable(id); say(`Table ${r.state.tables.at(-1).label} added in a free spot. Use "Move tables" to place it exactly.`); }}>+ Table</button>
           <button className={arrange ? 'on' : ''} onClick={() => setArrange(!arrange)}>{arrange ? '✓ Done moving' : '✥ Move tables'}</button>
-          <span className="zoom">
+          <span className="zoom d-only">
             <button onClick={() => setZoom(Math.max(0.6, +(zoom - 0.25).toFixed(2)))}>−</button>
             <button onClick={() => setZoom(1)} title="Fit to screen">{Math.round(zoom * 100)}%</button>
             <button onClick={() => setZoom(Math.min(3, +(zoom + 0.25).toFixed(2)))}>+</button>
@@ -253,7 +311,7 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
           </div>
         </section>
         <section className="list-head">
-          <h2>2. Drag guests to chairs</h2>
+          <h2>{isMobile ? '2. Tap a guest, then tap a chair' : '2. Drag guests to chairs'}</h2>
           <input className="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name or group…" />
           <label className="chk"><input type="checkbox" checked={showSeated} onChange={(e) => setShowSeated(e.target.checked)} /> show seated guests too</label>
           {selGuest && byId.get(selGuest) && <div className="hint">Now click a chair for <b>{byId.get(selGuest).name}</b> (Esc to cancel)</div>}
@@ -267,9 +325,14 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
       </aside>
 
       <main className="planwrap">
-        {mode === 'demo' && <div className="banner">Demo with made-up names. Nothing here is saved.</div>}
+        {mode === 'demo' && <div className="banner d-only">Demo with made-up names. Nothing here is saved.</div>}
         {arrange && <div className="banner">Move tables: drag a table's centre to a new spot. Click "Done moving" when finished.</div>}
-        <div className="planscroll">{plan}</div>
+        <div className="planscroll" ref={scrollRef}>{plan}</div>
+        <div className="mzoom m-only">
+          <button onClick={() => setZoom((z) => z + 0.5)} aria-label="Zoom in">+</button>
+          <button onClick={() => setZoom(2)} className="zl">{Math.round(zoom * 100)}%</button>
+          <button onClick={() => setZoom((z) => z - 0.5)} aria-label="Zoom out">−</button>
+        </div>
         <div className="planfoot">Hover a chair to see the name · click a table to see its 10 seats · double-click a chair to unseat
           <label className="chk"><input type="checkbox" checked={showNames} onChange={(e) => setShowNames(e.target.checked)} /> names on plan when zoomed ≥150%</label></div>
       </main>
@@ -287,10 +350,12 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
                 const g = gid && byId.get(gid);
                 return (
                   <div key={i} className={'seatrow' + (drag && drag.over === `seat:${table.id}:${i}` ? ' over' : '')} data-drop="seat" data-table={table.id} data-seat={i}
-                    onClick={() => selGuest && drop(selGuest, { kind: 'seat', table: table.id, seat: i })}>
+                    onClick={() => { if (selGuest) drop(selGuest, { kind: 'seat', table: table.id, seat: i }); else if (!gid) openPicker(table.id, i); }}>
                     <span className="no">{i + 1}</span>
-                    {g ? chip(g, <button className="x" title="Remove from seat" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); dispatch({ type: 'unseat', gid }); }}>×</button>, true)
-                      : <span className="free">{selGuest ? 'click to seat here' : 'empty – drop a guest here'}</span>}
+                    {g ? chip(g, <>
+                      <button className="mv m-only" onClick={(e) => { e.stopPropagation(); setSelGuest(gid); setMtab('plan'); }}>Move</button>
+                      <button className="x" title="Remove from seat" aria-label="Unseat" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); dispatch({ type: 'unseat', gid }); say(`${g.name} moved back to the list`); }}>×</button></>, true)
+                      : <span className="free">{selGuest ? (isMobile ? 'tap to seat here' : 'click to seat here') : (isMobile ? 'empty – tap to choose a guest' : 'empty – drop a guest here, or click to choose')}</span>}
                   </div>
                 );
               })}
@@ -319,11 +384,69 @@ export default function Planner({ state: liveState, dispatch, undo, canUndo, mod
         <h2 className="tl-h">Tables</h2>
         <div className="tablelist">
           {M.sortedTables(state).map((t) => { const n = t.seats.filter(Boolean).length; return (
-            <button key={t.id} className={'tl' + (t.id === selTable ? ' sel' : '') + (n === t.seats.length ? ' full' : n ? ' part' : '')} onClick={() => setSelTable(t.id)}
+            <button key={t.id} className={'tl' + (t.id === selTable ? ' sel' : '') + (n === t.seats.length ? ' full' : n ? ' part' : '')} onClick={() => { setSelTable(t.id); if (isMobile) document.querySelector('aside.right')?.scrollTo({ top: 0 }); }}
               data-drop="table" data-table={t.id}>{t.label}<small>{n}/{t.seats.length}</small></button>); })}
         </div>
       </aside>
 
+      {selGuest && byId.get(selGuest) && (
+        <div className="selbar m-only">
+          <span>{where.has(selGuest) ? 'Moving' : 'Seating'}: <b>{byId.get(selGuest).name}</b> – tap a chair{mtab === 'table' ? ' or seat row' : ''}{where.has(selGuest) ? ' (a taken chair swaps)' : ''}</span>
+          <button onClick={() => setSelGuest(null)}>Cancel</button>
+        </div>
+      )}
+      <nav className="tabbar m-only">
+        <button className={mtab === 'plan' ? 'on' : ''} onClick={() => setMtab('plan')}><span>🗺️</span>Plan</button>
+        <button className={mtab === 'guests' ? 'on' : ''} onClick={() => setMtab('guests')}><span>👥</span>Guests{total - seated > 0 ? ` (${total - seated})` : ''}</button>
+        <button className={mtab === 'table' ? 'on' : ''} onClick={() => setMtab('table')}><span>🪑</span>{table ? `Table ${table.label}` : 'Tables'}</button>
+      </nav>
+      {picker && (() => {
+        const t = state.tables.find((x) => x.id === picker.table);
+        if (!t) return null;
+        const list = pickerGuests(state, pickerQ, pickerAll);
+        const occ = t.seats[picker.seat] && byId.get(t.seats[picker.seat]);
+        return (
+          <div className="sheet-bg" onClick={() => setPicker(null)}>
+            <div className="sheet" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Choose a guest">
+              <div className="sheet-h">
+                <div><b>Who sits at Table {t.label}, seat {picker.seat + 1}?</b>{occ && <div className="sub">Now: {occ.name} (will swap / go back to list)</div>}</div>
+                <button className="x big" onClick={() => setPicker(null)} aria-label="Close">×</button>
+              </div>
+              <input className="search" value={pickerQ} onChange={(e) => setPickerQ(e.target.value)} placeholder="Search name or group…" />
+              <label className="chk"><input type="checkbox" checked={pickerAll} onChange={(e) => setPickerAll(e.target.checked)} /> include seated guests (moves them here)</label>
+              <div className="picklist">
+                {list.map((g) => { const w = where.get(g.id); return (
+                  <button key={g.id} className="pick" onClick={() => { drop(g.id, { kind: 'seat', table: t.id, seat: picker.seat }); setPicker(null); }}>
+                    <span className="dot" style={{ background: color(g) }} /><span className="nm">{g.name}</span>
+                    {g.group && <span className="tag">{g.group}</span>}{w && <span className="tag where">T{w.table.label}·{w.seat + 1}</span>}
+                  </button>); })}
+                {!list.length && <div className="empty">{total ? (pickerQ ? 'No match' : 'Everyone is seated – tick “include seated guests” to move someone here') : 'No guests yet – add some in the Guests tab'}</div>}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+      {chairMenu && (() => {
+        const g = byId.get(chairMenu.gid), t = state.tables.find((x) => x.id === chairMenu.table);
+        if (!g || !t) return null;
+        const close = () => setChairMenu(null);
+        return (
+          <div className="sheet-bg" onClick={close}>
+            <div className="sheet small" onClick={(e) => e.stopPropagation()} role="dialog" aria-label={g.name}>
+              <div className="sheet-h">
+                <div><b className="big-name">{g.name}</b><div className="sub">Table {t.label} · Seat {chairMenu.seat + 1}{g.group ? ' · ' + g.group : ''}</div></div>
+                <button className="x big" onClick={close} aria-label="Close">×</button>
+              </div>
+              <div className="sheet-actions">
+                <button className="primary" onClick={() => { setSelGuest(g.id); close(); }}>Move to another chair</button>
+                <button onClick={() => { dispatch({ type: 'unseat', gid: g.id }); say(`${g.name} moved back to the list`); close(); }}>Unseat (back to guest list)</button>
+                <button onClick={() => { setSelTable(t.id); setMtab('table'); close(); }}>Open table {t.label}</button>
+                <button onClick={close}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
       {drag && byId.get(drag.gid) && <div className="ghost" style={{ left: drag.x + 12, top: drag.y + 8 }}><span className="dot" style={{ background: color(byId.get(drag.gid)) }} />{byId.get(drag.gid).name}</div>}
       {hover && !drag && <div className="tip" style={{ left: hover.x + 14, top: hover.y + 14 }}><b>{hover.title}</b><div>{hover.sub}</div></div>}
       {msg && <div className="toast">{msg}</div>}

@@ -1,4 +1,4 @@
-# Wedding Seating Planner (v0.2 – shared plan)
+# Wedding Seating Planner (v0.3 – shared plan, works on phones)
 
 A small web app to seat wedding guests on the ballroom floor plan (15 round tables, 10 chairs each: VIP 1, VIP 2, 1–3, 5–13, 15).
 
@@ -23,7 +23,18 @@ Nothing gets lost. Every change (seat a guest, move a table, rename…) is saved
 - *Reset all* and *Clear seats* affect **everyone**, so the app asks you first.
 - *Undo* is only available in offline mode, because in the shared plan it could undo someone else's work.
 
-## How to use
+## On a phone
+Open the same link on your phone (iPhone Safari or Android Chrome) and enter your name and the passcode. Tip: use "Add to Home Screen" so it opens like an app.
+The screen has three tabs at the bottom: **Plan**, **Guests** and **Table**.
+- **Easiest way to seat someone:** tap a table on the plan (or in the Table tab). Its 10 seats are listed. Tap an empty seat, then tap a guest in the list that pops up (you can search).
+- **From the guest list:** in **Guests**, tap a name. A yellow bar says "Seating: name – tap a chair". Then tap a chair on the plan. *Cancel* stops it.
+- **Tap a chair with someone on it** to see their name, then choose **Move to another chair** (then tap the new chair; a taken chair swaps) or **Unseat**.
+- In the Table tab, each seated guest has **Move** and **×** (unseat) buttons.
+- **Zoom:** use the + / − buttons, or pinch with two fingers. Drag with one finger to look around.
+- **☰ menu** (top right) has Add names, Import Excel/CSV, Export Excel, + Table, Move tables, Clear seats and Reset all.
+- Excel import and export work on phones too. The exported file goes to your Downloads (on iPhone: the Files app).
+
+## How to use (computer)
 1. **Add guests**: paste names (one per line) and click *Add names*, or click *Import Excel / CSV…*.
    - The app reads the first sheet. It uses the column called **Name** (or the first column if there's no header).
    - An optional **Group** or **Side** column shows as a tag and colours the chair.
